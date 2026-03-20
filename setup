@@ -1,0 +1,331 @@
+#!/usr/bin/env bash
+
+RED='\033[0;31m'
+ORANGE='\033[38;5;214m'
+GREY='\033[38;5;243m'
+GREEN='\033[38;5;46m'
+BLACK_ON_BLUE='\033[30;44m'
+RESET='\033[0m'
+
+# Examples:
+#   current_value="$(get_env_var OLLAMA_API_KEY)"
+#   current_value="$(get_env_var DATABASE_URL .env)"
+
+get_env_var() {
+  local var_name="$1"
+  local env_file="${2:-.env}"
+  sed -n "s/^${var_name}=\(.*\)$/\1/p" "$env_file" 2>/dev/null | tr -d '"'\'''
+}
+
+
+# Usage:
+#   ensure_env_var VAR_NAME [--prompt <text>] [--value <val>] [--env-file <file>]
+#
+# Examples:
+#   ensure_env_var OLLAMA_API_KEY --value "sk-ollama-$(openssl rand -hex 16)"
+#   ensure_env_var OLLAMA_API_KEY --prompt "Enter your Ollama API key"
+#   ensure_env_var OLLAMA_API_KEY --prompt "Enter your Ollama API key" --value "sk-ollama-$(openssl rand -hex 16)"
+
+ensure_env_var() {
+  local var_name="$1"
+  local prompt_text=""
+  local supplied_value=""
+  local env_file=".env"
+  shift
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --prompt)   prompt_text="$2";    shift 2 ;;
+      --value)    supplied_value="$2"; shift 2 ;;
+      --env-file) env_file="$2";       shift 2 ;;
+      *) echo "Unknown arg: $1" >&2; return 1 ;;
+    esac
+  done
+
+  # Read current value from env file
+  local current_value
+  current_value="$(sed -n "s/^${var_name}=\(.*\)$/\1/p" "$env_file" 2>/dev/null | tr -d '"'\''')"
+
+  if [ -n "$current_value" ]; then
+    local new_value
+    read -r -p "        ${var_name} [${current_value}]: " new_value
+    echo
+    if [ -z "$new_value" ]; then
+      new_value="$current_value"
+    fi
+    if [ "$new_value" != "$current_value" ]; then
+      sed -i "s|^${var_name}=.*|${var_name}=${new_value}|" "$env_file"
+    fi
+    export "${var_name}=${new_value}"
+    return 0
+  fi
+
+  echo -e "${GREEN}NOTE:${RESET}   ${var_name} has not been set in ${env_file} yet."
+  echo
+
+  local new_value=""
+
+  if [ -n "$prompt_text" ]; then
+    read -r -p "        ${prompt_text}: " new_value
+    [ -z "$new_value" ] && new_value="$supplied_value"  # fall back to --value
+    echo
+  elif [ -n "$supplied_value" ]; then
+    new_value="$supplied_value"
+  else
+    echo -e "${RED}ERROR:${RESET}  No --value or --prompt provided for ${var_name}." >&2
+    return 1
+  fi
+
+  if [ -z "$new_value" ]; then
+    echo -e "${RED}ERROR:${RESET}  Could not determine a value for ${var_name}." >&2
+    return 1
+  fi
+
+  if grep -q "^${var_name}=" "$env_file" 2>/dev/null; then
+    sed -i "s|^${var_name}=.*|${var_name}=${new_value}|" "$env_file"
+  else
+    echo "${var_name}=${new_value}" >> "$env_file"
+  fi
+
+  export "${var_name}=${new_value}"
+
+  echo "        ${var_name}: ${new_value}"
+  echo
+}
+
+
+# Examples:
+#   if ! prompt_yn "Would you like to build it now?"; then ...
+prompt_yn() {
+  local msg="$1"
+  while true; do
+    read -rp "        $(echo -e "${msg} [y/N] ")" yn
+    case "${yn,,}" in
+      y|yes) return 0 ;;
+      n|no|"") return 1 ;;
+      *) echo "        Please answer y or n." ;;
+    esac
+  done
+}
+
+
+# Ensures the user is logged in to Docker Hub.
+# Returns 0 if logged in (or just logged in successfully), 1 otherwise.
+ensure_docker_login() {
+  if docker info 2>/dev/null | grep -q "Username:"; then
+    return 0
+  fi
+  echo -e "${ORANGE}WARN${RESET}    You are not logged in to Docker Hub."
+  echo
+  read -rp "        Docker Hub username: " DH_USER
+  read -rsp "        Docker Hub password/token: " DH_PASS
+  echo
+  echo "        Logging in to Docker Hub as '${DH_USER}'..."
+  if echo "${DH_PASS}" | docker login --username "${DH_USER}" --password-stdin; then
+    echo "        Logged in as '${DH_USER}'."
+    echo
+    return 0
+  else
+    echo
+    echo -e "${RED}ERROR:${RESET}  Docker Hub login failed."
+    return 1
+  fi
+}
+
+
+# Queries Docker Hub for the latest patch release of a given CUDA major.minor.
+# Usage: resolve_cuda_patch_version 13.1   →  prints "13.1.1"
+# Falls back to "${1}.0" if the query fails.
+resolve_cuda_patch_version() {
+  local major_minor="$1"
+  local resolved
+  resolved="$(
+    curl -sf "https://hub.docker.com/v2/repositories/nvidia/cuda/tags?name=${major_minor}&page_size=100" \
+      | jq -r '.results[].name' \
+      | grep -E "^${major_minor}\.[0-9]+-runtime-ubuntu22.04$" \
+      | sort -V \
+      | tail -1 \
+      | sed 's/-runtime-ubuntu22.04//'
+  )" 2>/dev/null
+  [ -z "$resolved" ] && resolved="${major_minor}.0"
+  echo "$resolved"
+}
+
+
+echo "=========== setup: ollama-bearer-auth ============"
+echo
+
+OS_CUDA_VERSION="$(nvidia-smi | awk -F 'CUDA Version: ' '/CUDA Version/ {split($2,a," "); print a[1]; exit}')"
+
+# ── resolve CUDA version for the container image ─────────────────────────────
+CUDA_VERSION="$(get_env_var CUDA_VERSION)"
+
+if [ -z "$CUDA_VERSION" ]; then
+  RESOLVED_CUDA_VERSION="$(resolve_cuda_patch_version "$OS_CUDA_VERSION")"
+fi
+
+echo "        host OS CUDA version: $OS_CUDA_VERSION"
+echo
+echo -e "${GREY}        The CUDA version of the image must match the host OS on the"
+echo -e "        machine that will run the container. If you are building for a"
+echo -e "        different machine, enter that machine's CUDA version instead.${RESET}"
+echo
+
+ensure_env_var CUDA_VERSION \
+  --prompt "Enter CUDA version (default: ${RESOLVED_CUDA_VERSION:-$CUDA_VERSION})" \
+  --value "${RESOLVED_CUDA_VERSION:-$CUDA_VERSION}"
+
+# Re-read CUDA_VERSION after ensure_env_var may have set it
+CUDA_VERSION="$(get_env_var CUDA_VERSION)"
+
+# If the user entered only major.minor (e.g., 13.1), resolve the latest patch
+if [[ "$CUDA_VERSION" =~ ^[0-9]+\.[0-9]+$ ]]; then
+  RESOLVED="$(resolve_cuda_patch_version "$CUDA_VERSION")"
+  echo "        Resolved ${CUDA_VERSION} → ${RESOLVED}"
+  echo
+  if prompt_yn "Use CUDA version ${RESOLVED}?"; then
+    sed -i "s|^CUDA_VERSION=.*|CUDA_VERSION=${RESOLVED}|" .env
+    export CUDA_VERSION="$RESOLVED"
+  else
+    read -r -p "        Enter full CUDA version (e.g., ${CUDA_VERSION}.0): " FULL_VERSION
+    echo
+    sed -i "s|^CUDA_VERSION=.*|CUDA_VERSION=${FULL_VERSION}|" .env
+    export CUDA_VERSION="$FULL_VERSION"
+  fi
+  echo "        CUDA_VERSION: ${CUDA_VERSION}"
+  echo
+fi
+
+
+# ── ensure that all .env vars are set ────────────────────────────────────────
+IMAGE_OWNER="$(get_env_var IMAGE_OWNER)"
+IMAGE_NAME="$(get_env_var IMAGE_NAME)"
+FULL_IMAGE="$IMAGE_OWNER/$IMAGE_NAME:$CUDA_VERSION"
+
+if [ -n "$IMAGE_OWNER" ] && [ -n "$IMAGE_NAME" ]; then
+  echo "        docker image: $FULL_IMAGE  (<image_owner>/<image_name>:<cuda_version>)"
+else
+  echo "        docker image: <image_owner>/<image_name>:<cuda_version>"
+fi
+echo
+
+DOCKER_USER="$(docker info 2>/dev/null | sed -n 's/.*Username: *//p')"
+if [ -n "$DOCKER_USER" ]; then
+  ensure_env_var IMAGE_OWNER --prompt "Enter image owner: (default: $DOCKER_USER  <- docker hub username)" --value "$DOCKER_USER"
+else
+  ensure_env_var IMAGE_OWNER --prompt "Enter image owner: (eg: my_docker_hub_account)"
+fi
+ensure_env_var IMAGE_NAME --prompt "Enter image name: (default: ollama-bearer-auth)" --value ollama-bearer-auth
+
+# ensure that OLLAMA_API_KEY has been set
+ensure_env_var OLLAMA_API_KEY --value "sk-ollama-$(openssl rand -hex 16)"
+
+# ensure that OLLAMA_API_KEY has been set
+ensure_env_var EXPOSED_OLLAMA_PORT --prompt "Enter exposed ollama port (default: 8081)" --value 8081
+
+
+# ── check local image existence ──────────────────────────────────────────────
+if docker image inspect "${FULL_IMAGE}" &>/dev/null; then
+  echo "        image '${FULL_IMAGE}' found locally"
+else
+  echo -e "${ORANGE}WARN${RESET}    image '${FULL_IMAGE}' not found locally"
+  echo
+
+  # ── check Docker Hub and offer to pull ──────────────────────────────────────
+  PULLED=false
+  if ! docker info 2>/dev/null | grep -q "Username:"; then
+    echo "        Docker Hub login is required to check if this image is available to pull."
+    echo
+    if prompt_yn "Would you like to log in to Docker Hub?"; then
+      echo
+      if ! ensure_docker_login; then
+        echo
+      fi
+    else
+      echo
+    fi
+  fi
+
+  if docker info 2>/dev/null | grep -q "Username:"; then
+    if docker manifest inspect "${FULL_IMAGE}" &>/dev/null; then
+      echo "        image '${FULL_IMAGE}' found on Docker Hub"
+      echo
+      if prompt_yn "Would you like to pull it from Docker Hub?"; then
+        echo
+        echo "        pulling '${FULL_IMAGE}' from Docker Hub..."
+        echo
+        if docker pull "${FULL_IMAGE}"; then
+          echo
+          echo "        pull successful"
+          PULLED=true
+        else
+          echo
+          echo -e "${RED}ERROR:${RESET}  pull failed"
+          exit 1
+        fi
+      fi
+    else
+      echo "        image '${FULL_IMAGE}' not found on Docker Hub"
+      echo
+    fi
+  fi
+
+  # ── offer to build (if not pulled) ──────────────────────────────────────────
+  if [ "$PULLED" = false ]; then
+    if ! prompt_yn "Would you like to build it now?"; then
+      echo "        build skipped"
+      exit 0
+    fi
+
+    echo
+    echo "        building image '${FULL_IMAGE}'..."
+    if docker build --no-cache --build-arg CUDA_VERSION="${CUDA_VERSION}" -t "${FULL_IMAGE}" .; then
+      echo "        build successful"
+    else
+      echo "        build failed"
+      exit 1
+    fi
+  fi
+fi
+
+echo
+
+# ── offer to push image to Docker Hub ────────────────────────────────────────
+if [ "$PULLED" = true ]; then
+  echo "        push skipped (image was pulled from Docker Hub)"
+else
+  if ! docker info 2>/dev/null | grep -q "Username:"; then
+    echo "        Docker Hub login is required to check if this image already exists and to push it."
+    echo
+    if prompt_yn "Would you like to log in to Docker Hub?"; then
+      echo
+      if ! ensure_docker_login; then
+        echo
+      fi
+    else
+      echo
+    fi
+  fi
+
+  if docker info 2>/dev/null | grep -q "Username:"; then
+    if docker manifest inspect "${FULL_IMAGE}" &>/dev/null; then
+      echo "        image '${FULL_IMAGE}' already exists on Docker Hub"
+    elif prompt_yn "Would you like to push '${FULL_IMAGE}' to Docker Hub?"; then
+      echo
+      echo "        pushing '${FULL_IMAGE}' to Docker Hub..."
+      echo
+      if docker push "${FULL_IMAGE}"; then
+        echo
+        echo "        push successful"
+      else
+        echo
+        echo -e "${RED}ERROR:${RESET}  push failed"
+        exit 1
+      fi
+    else
+      echo "        push skipped"
+    fi
+  else
+    echo "        push skipped (not logged in)"
+  fi
+fi

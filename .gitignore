@@ -1,1 +1,6 @@
-.env.local
+# ignore sensitive key data
+.env
+
+# Ignore local IDE artifacts
+/.idea
+

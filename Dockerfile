@@ -1,7 +1,8 @@
-FROM nvidia/cuda:13.1.0-runtime-ubuntu22.04
+ARG CUDA_VERSION=MUST_SET_CUDA_VERSION
+FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu22.04
 
 # Install dependencies
-RUN apt-get update && apt-get install -y wget jq curl
+RUN apt-get update && apt-get install -y wget jq curl zstd
 
 # Install Ollama using the provided script
 RUN curl -fsSL https://ollama.com/install.sh | sh
@@ -15,7 +16,7 @@ RUN LATEST_CADDY_URL=$(wget -qO- "https://api.github.com/repos/caddyserver/caddy
 
 # Copy the Caddyfile and .env.local to the container
 COPY Caddyfile /etc/caddy/Caddyfile
-COPY .env.local /etc/caddy/.env.local
+COPY .env /etc/caddy/.env.local
 
 # Set the environment variable for the Ollama host
 ENV OLLAMA_HOST=0.0.0.0

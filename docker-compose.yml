@@ -1,15 +1,20 @@
 name: ollama-bearer-auth
 
 services:
-  server:
+  ollama:
     build:
       context: .
       dockerfile: Dockerfile
-    image: ollama-bearer-auth:latest
+    image: "${IMAGE_OWNER}/${IMAGE_NAME}:${CUDA_VERSION}"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
     ports:
-      - "8081:8081"
-    env_file:  # This directive is used to specify a file to import environment variables from
-      - .env.local
+      - "${EXPOSED_OLLAMA_PORT}:8081"
     environment:
       - OLLAMA_HOST=0.0.0.0
     volumes:
