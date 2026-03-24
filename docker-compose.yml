@@ -17,6 +17,7 @@ services:
       - "${EXPOSED_OLLAMA_PORT}:8081"
     environment:
       - OLLAMA_HOST=0.0.0.0
+      - OLLAMA_API_KEY
     volumes:
       - ~/.ollama:/root/.ollama
     restart: unless-stopped
