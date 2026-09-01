@@ -1,0 +1,262 @@
+#!/usr/bin/env bash
+#
+# Reports whether the ollama-bearer-auth image is out of date, shows the
+# digests the comparison is based on, and offers to update.
+#
+# Three independent things can be stale, so all three are checked:
+#
+#   1. the local image vs the one published on Docker Hub   (digest compare)
+#   2. the ollama inside the image vs the latest release     (version compare)
+#   3. a running container vs the local image                (image id compare)
+#
+# Usage: ./check_for_updates [image_ref]
+#        image_ref defaults to <IMAGE_OWNER>/<IMAGE_NAME>:<CUDA_VERSION> from .env
+
+source "$(dirname "$0")/lib.sh"
+
+
+# Prints the digest a local image was pushed to / pulled from, or nothing when
+# the image was built locally and never pushed (RepoDigests is empty then).
+# Usage: local_image_digest webstop/ollama-bearer-auth:12.4.1
+local_image_digest() {
+  local repo="${1%:*}"
+  docker image inspect "$1" --format '{{range .RepoDigests}}{{println .}}{{end}}' 2>/dev/null \
+    | grep "^${repo}@" \
+    | head -1 \
+    | sed 's/.*@//'
+}
+
+
+# Prints the Docker Hub tag record as JSON, or nothing if the tag is unknown
+# or Docker Hub cannot be reached.
+# Usage: hub_tag_json webstop/ollama-bearer-auth:12.4.1
+hub_tag_json() {
+  local repo="${1%:*}" tag="${1##*:}"
+  curl -sf "https://hub.docker.com/v2/repositories/${repo}/tags/${tag}"
+}
+
+
+# Adds an implicit ":latest" to an image reference that has no tag, the way
+# docker resolves it. A registry port (localhost:5000/foo) is not a tag.
+# Usage: normalize_image_ref webstop/ollama-bearer-auth  ->  ...:latest
+normalize_image_ref() {
+  case "${1##*/}" in
+    *:*) echo "$1" ;;
+    *)   echo "${1}:latest" ;;
+  esac
+}
+
+
+# Prints "<name> <image id>" for every running container using the given image
+# reference.
+#
+# 'docker ps --filter ancestor=' is deliberately not used: it resolves the tag
+# to an image id first, so a container still running an OLDER image under that
+# tag - exactly what this script looks for - would not match. Containers are
+# matched on the reference they were created from instead, plus any whose image
+# id already equals the tag's.
+# Usage: containers_from_image webstop/ollama-bearer-auth:12.4.1
+containers_from_image() {
+  local target="$1" local_id="$2" name ref image_id
+  for name in $(docker ps --format '{{.Names}}'); do
+    ref="$(normalize_image_ref "$(docker inspect "$name" --format '{{.Config.Image}}' 2>/dev/null)")"
+    image_id="$(docker inspect "$name" --format '{{.Image}}' 2>/dev/null)"
+    if [ "$ref" = "$target" ] || { [ -n "$local_id" ] && [ "$image_id" = "$local_id" ]; }; then
+      echo "${name} ${image_id}"
+    fi
+  done
+}
+
+
+# Prints the compose command that would recreate a running container, derived
+# from the labels compose stamped on it. Prints nothing for a non-compose
+# container.
+# Usage: compose_recreate_command core-cognition-ollama
+compose_recreate_command() {
+  local config_file service
+  config_file="$(docker inspect "$1" --format '{{index .Config.Labels "com.docker.compose.project.config_files"}}' 2>/dev/null)"
+  service="$(docker inspect "$1" --format '{{index .Config.Labels "com.docker.compose.service"}}' 2>/dev/null)"
+  [ -z "$config_file" ] || [ -z "$service" ] && return
+  echo "docker compose -f ${config_file} up -d ${service}"
+}
+
+
+echo "======= check_for_updates: ollama-bearer-auth ======="
+echo
+
+# ── resolve which image to check ─────────────────────────────────────────────
+if [ -n "$1" ]; then
+  IMAGE_REF="$1"
+else
+  IMAGE_OWNER="$(get_env_var IMAGE_OWNER)"
+  IMAGE_NAME="$(get_env_var IMAGE_NAME)"
+  CUDA_VERSION="$(get_env_var CUDA_VERSION)"
+  if [ -z "$IMAGE_OWNER" ] || [ -z "$IMAGE_NAME" ] || [ -z "$CUDA_VERSION" ]; then
+    echo -e "${RED}ERROR:${RESET}  .env is incomplete - run ./setup first, or pass an image reference." >&2
+    exit 1
+  fi
+  IMAGE_REF="${IMAGE_OWNER}/${IMAGE_NAME}:${CUDA_VERSION}"
+fi
+
+IMAGE_REF="$(normalize_image_ref "$IMAGE_REF")"
+
+echo "        image: ${IMAGE_REF}"
+echo
+
+if ! docker image inspect "$IMAGE_REF" &>/dev/null; then
+  echo -e "${ORANGE}WARN${RESET}    image '${IMAGE_REF}' is not present locally"
+  echo "        run ./setup to pull or build it"
+  echo
+  exit 0
+fi
+
+
+# ── 1. local image vs Docker Hub ─────────────────────────────────────────────
+LOCAL_DIGEST="$(local_image_digest "$IMAGE_REF")"
+HUB_JSON="$(hub_tag_json "$IMAGE_REF")"
+HUB_DIGEST="$(echo "$HUB_JSON" | jq -r '.digest // empty' 2>/dev/null)"
+HUB_UPDATED="$(echo "$HUB_JSON" | jq -r '.last_updated // empty' 2>/dev/null)"
+LOCAL_CREATED="$(docker image inspect "$IMAGE_REF" --format '{{.Created}}')"
+
+echo "        local digest:  ${LOCAL_DIGEST:-none  (built locally, never pushed)}"
+echo "        hub digest:    ${HUB_DIGEST:-none  (tag not published, or Docker Hub unreachable)}"
+echo "        local built:   ${LOCAL_CREATED}"
+echo "        hub updated:   ${HUB_UPDATED:-unknown}"
+echo
+
+PULL_AVAILABLE=false
+
+if [ -z "$HUB_DIGEST" ]; then
+  echo "        -> nothing to compare against on Docker Hub"
+elif [ -z "$LOCAL_DIGEST" ]; then
+  echo "        -> local image was built here and never pushed, so its content"
+  echo "           cannot be compared to the published tag by digest"
+elif [ "$LOCAL_DIGEST" = "$HUB_DIGEST" ]; then
+  echo "        -> digests match: local image is the published '${IMAGE_REF}'"
+else
+  # Digests differ. Which side is newer decides whether pulling is the fix.
+  if [ -n "$HUB_UPDATED" ] && [[ "$LOCAL_CREATED" > "$HUB_UPDATED" ]]; then
+    echo -e "${ORANGE}WARN${RESET}    digests differ, and the local image is NEWER than Docker Hub"
+    echo "        -> this image was rebuilt locally and not pushed; run ./setup to push it"
+  else
+    echo -e "${ORANGE}WARN${RESET}    digests differ, and Docker Hub is newer"
+    echo "        -> a different image has been published under this tag"
+    PULL_AVAILABLE=true
+  fi
+fi
+echo
+
+
+# ── 2. ollama in the image vs the latest release ─────────────────────────────
+IMAGE_OLLAMA_VERSION="$(image_ollama_version "$IMAGE_REF")"
+LATEST_OLLAMA_VERSION="$(latest_ollama_version)"
+
+echo "        ollama in image: ${IMAGE_OLLAMA_VERSION:-unknown}"
+echo "        latest ollama:   ${LATEST_OLLAMA_VERSION:-unknown  (lookup failed)}"
+echo
+
+REBUILD_AVAILABLE=false
+
+if [ -z "$IMAGE_OLLAMA_VERSION" ] || [ -z "$LATEST_OLLAMA_VERSION" ]; then
+  echo "        -> could not compare ollama versions"
+elif version_gt "$LATEST_OLLAMA_VERSION" "$IMAGE_OLLAMA_VERSION"; then
+  echo -e "${ORANGE}WARN${RESET}    the image is ${IMAGE_OLLAMA_VERSION}, upstream is ${LATEST_OLLAMA_VERSION}"
+  echo "        -> the image installs ollama at build time, so only a rebuild updates it"
+  REBUILD_AVAILABLE=true
+else
+  echo "        -> image is running the latest ollama"
+fi
+echo
+
+
+# ── 3. running containers vs the local image ─────────────────────────────────
+LOCAL_IMAGE_ID="$(docker image inspect "$IMAGE_REF" --format '{{.Id}}')"
+CONTAINERS="$(containers_from_image "$IMAGE_REF" "$LOCAL_IMAGE_ID")"
+STALE_CONTAINERS=()
+
+if [ -z "$CONTAINERS" ]; then
+  echo "        no running containers use this image"
+else
+  while read -r name image_id; do
+    [ -z "$name" ] && continue
+    if [ "$image_id" = "$LOCAL_IMAGE_ID" ]; then
+      echo "        container '${name}' is running the current local image"
+    else
+      echo -e "${ORANGE}WARN${RESET}    container '${name}' is running an older image"
+      echo "        started from: ${image_id}"
+      echo "        local image:  ${LOCAL_IMAGE_ID}"
+      STALE_CONTAINERS+=("$name")
+    fi
+  done <<< "$CONTAINERS"
+fi
+echo
+
+
+# ── offer to act on what was found ───────────────────────────────────────────
+if [ "$PULL_AVAILABLE" = false ] && [ "$REBUILD_AVAILABLE" = false ] && [ ${#STALE_CONTAINERS[@]} -eq 0 ]; then
+  echo -e "${GREEN}NOTE:${RESET}   everything is up to date."
+  echo
+  exit 0
+fi
+
+if [ "$PULL_AVAILABLE" = true ]; then
+  if prompt_yn "Pull '${IMAGE_REF}' from Docker Hub?"; then
+    echo
+    if docker pull "$IMAGE_REF"; then
+      echo
+      echo "        pull successful"
+      # The pull replaced the tag, so anything still running is now stale.
+      LOCAL_IMAGE_ID="$(docker image inspect "$IMAGE_REF" --format '{{.Id}}')"
+      STALE_CONTAINERS=()
+      while read -r name image_id; do
+        [ -z "$name" ] && continue
+        [ "$image_id" != "$LOCAL_IMAGE_ID" ] && STALE_CONTAINERS+=("$name")
+      done <<< "$(containers_from_image "$IMAGE_REF" "$LOCAL_IMAGE_ID")"
+    else
+      echo
+      echo -e "${RED}ERROR:${RESET}  pull failed"
+      exit 1
+    fi
+  else
+    echo "        pull skipped"
+  fi
+  echo
+fi
+
+if [ "$REBUILD_AVAILABLE" = true ]; then
+  echo -e "${GREY}        ./setup offers the rebuild, and handles pushing the result.${RESET}"
+  echo
+  if prompt_yn "Run ./setup now to rebuild with ollama ${LATEST_OLLAMA_VERSION}?"; then
+    echo
+    exec "$(dirname "$0")/setup"
+  else
+    echo "        rebuild skipped"
+  fi
+  echo
+fi
+
+# Containers may belong to another compose project, so each one is confirmed
+# separately rather than recreated as a group.
+for name in "${STALE_CONTAINERS[@]}"; do
+  RECREATE_CMD="$(compose_recreate_command "$name")"
+  if [ -z "$RECREATE_CMD" ]; then
+    echo "        '${name}' is not a compose container - recreate it manually"
+    echo
+    continue
+  fi
+  echo "        ${RECREATE_CMD}"
+  echo
+  if prompt_yn "Recreate '${name}' with the updated image?"; then
+    echo
+    if eval "$RECREATE_CMD"; then
+      echo
+      echo "        '${name}' recreated"
+    else
+      echo
+      echo -e "${RED}ERROR:${RESET}  could not recreate '${name}'"
+    fi
+  else
+    echo "        '${name}' left running the older image"
+  fi
+  echo
+done

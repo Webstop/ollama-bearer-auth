@@ -1,179 +1,51 @@
 #!/usr/bin/env bash
 
-RED='\033[0;31m'
-ORANGE='\033[38;5;214m'
-GREY='\033[38;5;243m'
-GREEN='\033[38;5;46m'
-BLACK_ON_BLUE='\033[30;44m'
-RESET='\033[0m'
-
-# Examples:
-#   current_value="$(get_env_var OLLAMA_API_KEY)"
-#   current_value="$(get_env_var DATABASE_URL .env)"
-
-get_env_var() {
-  local var_name="$1"
-  local env_file="${2:-.env}"
-  sed -n "s/^${var_name}=\(.*\)$/\1/p" "$env_file" 2>/dev/null | tr -d '"'\'''
-}
-
-
-# Usage:
-#   ensure_env_var VAR_NAME [--prompt <text>] [--value <val>] [--env-file <file>]
-#
-# Examples:
-#   ensure_env_var OLLAMA_API_KEY --value "sk-ollama-$(openssl rand -hex 16)"
-#   ensure_env_var OLLAMA_API_KEY --prompt "Enter your Ollama API key"
-#   ensure_env_var OLLAMA_API_KEY --prompt "Enter your Ollama API key" --value "sk-ollama-$(openssl rand -hex 16)"
-
-ensure_env_var() {
-  local var_name="$1"
-  local prompt_text=""
-  local supplied_value=""
-  local env_file=".env"
-  shift
-
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --prompt)   prompt_text="$2";    shift 2 ;;
-      --value)    supplied_value="$2"; shift 2 ;;
-      --env-file) env_file="$2";       shift 2 ;;
-      *) echo "Unknown arg: $1" >&2; return 1 ;;
-    esac
-  done
-
-  # Read current value from env file
-  local current_value
-  current_value="$(sed -n "s/^${var_name}=\(.*\)$/\1/p" "$env_file" 2>/dev/null | tr -d '"'\''')"
-
-  if [ -n "$current_value" ]; then
-    local new_value
-    read -r -p "        ${var_name} [${current_value}]: " new_value
-    echo
-    if [ -z "$new_value" ]; then
-      new_value="$current_value"
-    fi
-    if [ "$new_value" != "$current_value" ]; then
-      sed -i "s|^${var_name}=.*|${var_name}=${new_value}|" "$env_file"
-    fi
-    export "${var_name}=${new_value}"
-    return 0
-  fi
-
-  echo -e "${GREEN}NOTE:${RESET}   ${var_name} has not been set in ${env_file} yet."
-  echo
-
-  local new_value=""
-
-  if [ -n "$prompt_text" ]; then
-    read -r -p "        ${prompt_text}: " new_value
-    [ -z "$new_value" ] && new_value="$supplied_value"  # fall back to --value
-    echo
-  elif [ -n "$supplied_value" ]; then
-    new_value="$supplied_value"
-  else
-    echo -e "${RED}ERROR:${RESET}  No --value or --prompt provided for ${var_name}." >&2
-    return 1
-  fi
-
-  if [ -z "$new_value" ]; then
-    echo -e "${RED}ERROR:${RESET}  Could not determine a value for ${var_name}." >&2
-    return 1
-  fi
-
-  if grep -q "^${var_name}=" "$env_file" 2>/dev/null; then
-    sed -i "s|^${var_name}=.*|${var_name}=${new_value}|" "$env_file"
-  else
-    echo "${var_name}=${new_value}" >> "$env_file"
-  fi
-
-  export "${var_name}=${new_value}"
-
-  echo "        ${var_name}: ${new_value}"
-  echo
-}
-
-
-# Examples:
-#   if ! prompt_yn "Would you like to build it now?"; then ...
-prompt_yn() {
-  local msg="$1"
-  while true; do
-    read -rp "        $(echo -e "${msg} [y/N] ")" yn
-    case "${yn,,}" in
-      y|yes) return 0 ;;
-      n|no|"") return 1 ;;
-      *) echo "        Please answer y or n." ;;
-    esac
-  done
-}
-
-
-# Ensures the user is logged in to Docker Hub.
-# Returns 0 if logged in (or just logged in successfully), 1 otherwise.
-ensure_docker_login() {
-  if docker info 2>/dev/null | grep -q "Username:"; then
-    return 0
-  fi
-  echo -e "${ORANGE}WARN${RESET}    You are not logged in to Docker Hub."
-  echo
-  read -rp "        Docker Hub username: " DH_USER
-  read -rsp "        Docker Hub password/token: " DH_PASS
-  echo
-  echo "        Logging in to Docker Hub as '${DH_USER}'..."
-  if echo "${DH_PASS}" | docker login --username "${DH_USER}" --password-stdin; then
-    echo "        Logged in as '${DH_USER}'."
-    echo
-    return 0
-  else
-    echo
-    echo -e "${RED}ERROR:${RESET}  Docker Hub login failed."
-    return 1
-  fi
-}
-
-
-# Queries Docker Hub for the latest patch release of a given CUDA major.minor.
-# Usage: resolve_cuda_patch_version 13.1   →  prints "13.1.1"
-# Falls back to "${1}.0" if the query fails.
-resolve_cuda_patch_version() {
-  local major_minor="$1"
-  local resolved
-  resolved="$(
-    curl -sf "https://hub.docker.com/v2/repositories/nvidia/cuda/tags?name=${major_minor}&page_size=100" \
-      | jq -r '.results[].name' \
-      | grep -E "^${major_minor}\.[0-9]+-runtime-ubuntu22.04$" \
-      | sort -V \
-      | tail -1 \
-      | sed 's/-runtime-ubuntu22.04//'
-  )" 2>/dev/null
-  [ -z "$resolved" ] && resolved="${major_minor}.0"
-  echo "$resolved"
-}
+source "$(dirname "$0")/lib.sh"
 
 
 echo "=========== setup: ollama-bearer-auth ============"
 echo
 
-OS_CUDA_VERSION="$(nvidia-smi | awk -F 'CUDA Version: ' '/CUDA Version/ {split($2,a," "); print a[1]; exit}')"
+OS_CUDA_VERSION="$(host_cuda_version)"
 
 # ── resolve CUDA version for the container image ─────────────────────────────
 CUDA_VERSION="$(get_env_var CUDA_VERSION)"
 
-if [ -z "$CUDA_VERSION" ]; then
+# Only resolve a patch release when a host version was actually detected -
+# resolve_cuda_patch_version("") would otherwise fall back to a bogus ".0".
+if [ -z "$CUDA_VERSION" ] && [ -n "$OS_CUDA_VERSION" ]; then
   RESOLVED_CUDA_VERSION="$(resolve_cuda_patch_version "$OS_CUDA_VERSION")"
 fi
 
-echo "        host OS CUDA version: $OS_CUDA_VERSION"
+if [ -n "$OS_CUDA_VERSION" ]; then
+  echo "        host OS CUDA version: $OS_CUDA_VERSION"
+else
+  echo -e "${ORANGE}WARN${RESET}    could not detect the host CUDA version from nvidia-smi"
+fi
 echo
 echo -e "${GREY}        The CUDA version of the image must match the host OS on the"
 echo -e "        machine that will run the container. If you are building for a"
 echo -e "        different machine, enter that machine's CUDA version instead.${RESET}"
 echo
 
-ensure_env_var CUDA_VERSION \
-  --prompt "Enter CUDA version (default: ${RESOLVED_CUDA_VERSION:-$CUDA_VERSION})" \
-  --value "${RESOLVED_CUDA_VERSION:-$CUDA_VERSION}"
+DEFAULT_CUDA_VERSION="${RESOLVED_CUDA_VERSION:-$CUDA_VERSION}"
+
+if [ -n "$DEFAULT_CUDA_VERSION" ]; then
+  ensure_env_var CUDA_VERSION \
+    --prompt "Enter CUDA version (default: ${DEFAULT_CUDA_VERSION})" \
+    --value "${DEFAULT_CUDA_VERSION}"
+else
+  # Nothing detected and nothing in .env, so there is no default to offer.
+  while [[ ! "$CUDA_VERSION" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; do
+    if ! read -r -p "        Enter CUDA version (eg: 13.3 or 13.3.1): " CUDA_VERSION; then
+      echo
+      echo -e "${RED}ERROR:${RESET}  no CUDA version provided." >&2
+      exit 1
+    fi
+    echo
+  done
+  ensure_env_var CUDA_VERSION --value "$CUDA_VERSION"
+fi
 
 # Re-read CUDA_VERSION after ensure_env_var may have set it
 CUDA_VERSION="$(get_env_var CUDA_VERSION)"
@@ -187,8 +59,16 @@ if [[ "$CUDA_VERSION" =~ ^[0-9]+\.[0-9]+$ ]]; then
     sed -i "s|^CUDA_VERSION=.*|CUDA_VERSION=${RESOLVED}|" .env
     export CUDA_VERSION="$RESOLVED"
   else
-    read -r -p "        Enter full CUDA version (e.g., ${CUDA_VERSION}.0): " FULL_VERSION
-    echo
+    # Keep asking rather than writing an empty CUDA_VERSION to .env.
+    FULL_VERSION=""
+    while [[ ! "$FULL_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; do
+      if ! read -r -p "        Enter full CUDA version (e.g., ${CUDA_VERSION}.0): " FULL_VERSION; then
+        echo
+        echo -e "${RED}ERROR:${RESET}  no CUDA version provided." >&2
+        exit 1
+      fi
+      echo
+    done
     sed -i "s|^CUDA_VERSION=.*|CUDA_VERSION=${FULL_VERSION}|" .env
     export CUDA_VERSION="$FULL_VERSION"
   fi
@@ -225,6 +105,9 @@ ensure_env_var EXPOSED_OLLAMA_PORT --prompt "Enter exposed ollama port (default:
 
 
 # ── check local image existence ──────────────────────────────────────────────
+PULLED=false
+REBUILT=false
+
 if docker image inspect "${FULL_IMAGE}" &>/dev/null; then
   echo "        image '${FULL_IMAGE}' found locally"
 else
@@ -232,7 +115,6 @@ else
   echo
 
   # ── check Docker Hub and offer to pull ──────────────────────────────────────
-  PULLED=false
   if ! docker info 2>/dev/null | grep -q "Username:"; then
     echo "        Docker Hub login is required to check if this image is available to pull."
     echo
@@ -278,6 +160,7 @@ else
     fi
 
     echo
+    assert_cuda_base_image
     echo "        building image '${FULL_IMAGE}'..."
     if docker build --no-cache --build-arg CUDA_VERSION="${CUDA_VERSION}" -t "${FULL_IMAGE}" .; then
       echo "        build successful"
@@ -290,8 +173,49 @@ fi
 
 echo
 
+# ── report ollama version and offer to update ────────────────────────────────
+IMAGE_OLLAMA_VERSION="$(image_ollama_version "$FULL_IMAGE")"
+LATEST_OLLAMA_VERSION="$(latest_ollama_version)"
+
+echo "        ollama version in image: ${IMAGE_OLLAMA_VERSION:-unknown}"
+echo "        latest ollama release:   ${LATEST_OLLAMA_VERSION:-unknown  (lookup failed)}"
+echo
+
+if [ -z "$IMAGE_OLLAMA_VERSION" ] || [ -z "$LATEST_OLLAMA_VERSION" ]; then
+  echo -e "${ORANGE}WARN${RESET}    could not compare ollama versions - update check skipped"
+  echo
+elif version_gt "$LATEST_OLLAMA_VERSION" "$IMAGE_OLLAMA_VERSION"; then
+  echo -e "${ORANGE}WARN${RESET}    a newer ollama is available (${IMAGE_OLLAMA_VERSION} -> ${LATEST_OLLAMA_VERSION})"
+  echo
+  echo -e "${GREY}        Updating rebuilds '${FULL_IMAGE}' from scratch, installing"
+  echo -e "        the latest ollama and caddy. Models in ~/.ollama are not affected."
+  echo -e "        Press return to skip.${RESET}"
+  echo
+
+  if prompt_yn "Rebuild image with ollama ${LATEST_OLLAMA_VERSION}?"; then
+    echo
+    assert_cuda_base_image
+    echo "        rebuilding image '${FULL_IMAGE}'..."
+    if docker build --no-cache --build-arg CUDA_VERSION="${CUDA_VERSION}" -t "${FULL_IMAGE}" .; then
+      echo "        rebuild successful"
+      REBUILT=true
+      IMAGE_OLLAMA_VERSION="$(image_ollama_version "$FULL_IMAGE")"
+      echo "        ollama version in image: ${IMAGE_OLLAMA_VERSION:-unknown}"
+    else
+      echo -e "${RED}ERROR:${RESET}  rebuild failed"
+      exit 1
+    fi
+  else
+    echo "        update skipped"
+  fi
+  echo
+else
+  echo -e "${GREEN}NOTE:${RESET}   image is already running the latest ollama."
+  echo
+fi
+
 # ── offer to push image to Docker Hub ────────────────────────────────────────
-if [ "$PULLED" = true ]; then
+if [ "$PULLED" = true ] && [ "$REBUILT" = false ]; then
   echo "        push skipped (image was pulled from Docker Hub)"
 else
   if ! docker info 2>/dev/null | grep -q "Username:"; then
@@ -308,9 +232,30 @@ else
   fi
 
   if docker info 2>/dev/null | grep -q "Username:"; then
+    DO_PUSH=false
+
     if docker manifest inspect "${FULL_IMAGE}" &>/dev/null; then
       echo "        image '${FULL_IMAGE}' already exists on Docker Hub"
+      # The tag only encodes the CUDA version, so an ollama update reuses the
+      # same tag - offer to overwrite it rather than skipping the push.
+      if [ "$REBUILT" = true ]; then
+        echo
+        echo -e "${GREY}        The tag only encodes the CUDA version, so the image just rebuilt"
+        echo -e "        with ollama ${IMAGE_OLLAMA_VERSION:-latest} reuses that same tag.${RESET}"
+        echo
+        if prompt_yn "Overwrite '${FULL_IMAGE}' on Docker Hub?"; then
+          DO_PUSH=true
+        else
+          echo "        push skipped"
+        fi
+      fi
     elif prompt_yn "Would you like to push '${FULL_IMAGE}' to Docker Hub?"; then
+      DO_PUSH=true
+    else
+      echo "        push skipped"
+    fi
+
+    if [ "$DO_PUSH" = true ]; then
       echo
       echo "        pushing '${FULL_IMAGE}' to Docker Hub..."
       echo
@@ -322,8 +267,6 @@ else
         echo -e "${RED}ERROR:${RESET}  push failed"
         exit 1
       fi
-    else
-      echo "        push skipped"
     fi
   else
     echo "        push skipped (not logged in)"

@@ -11,6 +11,7 @@ Caddy server to securely authenticate and proxy requests to a local Ollama insta
 - **Dockerized Setup**: Both Ollama and Caddy are containerized.
 - **Latest Versions**: Utilizes the latest versions of Ollama and Caddy, ensuring the setup benefits from the most recent updates, security patches, and features. Docker image is configured to pull the latest versions automatically.
 - **GPU Support**: Based on NVIDIA CUDA runtime for Ubuntu 22.04. The `setup` script auto-detects your host CUDA version and resolves the matching container image.
+- **Update Checking**: Both `setup` and `check_for_updates` compare the Ollama version baked into the image against the latest release, and offer to rebuild when it has fallen behind. See [Keeping the Image Up to Date](#keeping-the-image-up-to-date).
 
 
 
@@ -32,6 +33,7 @@ Significant modifications include:
 - dynamic CUDA version selection
 - automatic bearer token generation
 - auto pull/push to [Docker Hub](https://hub.docker.com/) account
+- Ollama update detection, in `setup` and in the standalone `check_for_updates` script
 - future: admin webapp for configuring api access
 
 Note that bartolli has another project that provides an example of how to support multiple bearer tokens stored in a config file: [ollama-bearer-auth-caddy](https://github.com/bartolli/ollama-bearer-auth-caddy)
@@ -61,6 +63,26 @@ Once setup is complete, start the services:
 docker compose up -d
 ```
 
+Later on, to find out whether a newer Ollama is available:
+
+```bash
+./check_for_updates
+```
+
+
+
+## Project Files
+
+| File | Purpose |
+|---|---|
+| `setup` | Interactive configuration, build, update and push. Start here. |
+| `check_for_updates` | Reports whether the image, its Ollama, or a running container is out of date. |
+| `lib.sh` | Shared shell helpers sourced by both scripts. Not run directly. |
+| `Dockerfile` | Builds the image from an `nvidia/cuda` runtime base. |
+| `Caddyfile` | Caddy reverse proxy and bearer token authentication. |
+| `start_services.sh` | Container entrypoint; runs and supervises Ollama and Caddy. |
+| `docker-compose.yml` | Service definition, driven by `.env`. |
+
 
 
 ## Setup Script Details
@@ -71,7 +93,11 @@ The setup script can be ran again if you want to make changes.  Or if you just h
 
 ### Phase 1: CUDA Version
 
-The script detects your host CUDA version from `nvidia-smi` and resolves the latest patch release from Docker Hub (e.g., `13.1` resolves to `13.1.1`). You can accept the detected version or enter a different one — useful when building an image for a different machine.  The CUDA version will be written to **`CUDA_VERSION`** in the `.env`.
+The script detects your host CUDA version and resolves the latest patch release from Docker Hub (e.g., `13.1` resolves to `13.1.1`). You can accept the detected version or enter a different one — useful when building an image for a different machine.  The CUDA version will be written to **`CUDA_VERSION`** in the `.env`.
+
+Detection reads `nvidia-smi -q -x` (XML) rather than the summary table at the top of plain `nvidia-smi` output. The table's label changed from `CUDA Version` to `CUDA UMD Version` in driver 610.x, which silently broke text parsing of that line. The XML exposes both `<cuda_umd_version>` and the older `<cuda_version>`, so both current and older drivers work. NVIDIA has marked `cuda_version` for removal in CUDA 14.0, so the newer tag is preferred and the older one is only a fallback.
+
+If the host CUDA version cannot be detected at all — no GPU, no driver, or `nvidia-smi` missing — the script says so and prompts for the version instead of guessing. A value already present in `.env` always wins over detection, so a pinned `CUDA_VERSION` is never silently changed.
 
 ### Phase 2: Environment Variables
 
@@ -92,12 +118,50 @@ The script looks for the image `<IMAGE_OWNER>/<IMAGE_NAME>:<CUDA_VERSION>` and f
 
 If you are **not logged in to Docker Hub**, the script can't check for or pull remote images. You can still build locally — you'll just skip the pull/push steps.  However, the script does ask you at this point whether you want to login and will facilitate that process.
 
-### Phase 4: Docker Hub Push
+Before any build, the script confirms that the base image `nvidia/cuda:<CUDA_VERSION>-runtime-ubuntu22.04` is actually published. A `CUDA_VERSION` with no matching base image is reported up front, along with the patch releases that *are* published for that major.minor:
 
-After building or pulling:
+```
+ERROR:  base image 'nvidia/cuda:13.3.9-runtime-ubuntu22.04' is not published
 
-- **Image was pulled** — Push is skipped (it's already on Docker Hub).
+        published 13.3 releases: 13.3.0 13.3.1
+
+        Set CUDA_VERSION in .env to a published tag - see
+        https://hub.docker.com/r/nvidia/cuda/tags
+```
+
+This check needs no Docker Hub login. If Docker Hub can't be reached it warns and continues, letting the build report the problem itself.
+
+### Phase 4: Ollama Version Check
+
+The `Dockerfile` installs Ollama with `curl -fsSL https://ollama.com/install.sh | sh`, which always takes the latest release **at build time**. Nothing pins a version, so an image keeps whatever Ollama it was built with — updating means rebuilding.
+
+Whichever path Phase 3 took, the script now reports the Ollama version inside the image alongside the latest release, and offers a rebuild if the image has fallen behind:
+
+```
+        ollama version in image: 0.18.2
+        latest ollama release:   0.33.2
+
+WARN    a newer ollama is available (0.18.2 -> 0.33.2)
+
+        Updating rebuilds 'webstop/ollama-bearer-auth:12.4.1' from scratch, installing
+        the latest ollama and caddy. Models in ~/.ollama are not affected.
+        Press return to skip.
+
+        Rebuild image with ollama 0.33.2? [y/N]
+```
+
+Press return to decline and leave the image as it is. Accepting runs `docker build --no-cache`, which reinstalls both Ollama and Caddy at their current releases. Models live in the mounted `~/.ollama` volume and are untouched by a rebuild.
+
+If either version can't be determined — the image won't run, or the release lookup fails — the script says so and skips the comparison rather than prompting on incomplete information.
+
+### Phase 5: Docker Hub Push
+
+After building, pulling or rebuilding:
+
+- **Image was pulled and not rebuilt** — Push is skipped (it's already on Docker Hub).
 - **Image was built locally and you are logged in** — Offers to push the image to Docker Hub so others can pull it.
+- **Tag already exists on Docker Hub, and you just rebuilt** — Offers to overwrite it. Because the tag encodes only the CUDA version, an Ollama update produces a *different image under the same tag*; without this the updated image would stay stuck on your machine.
+- **Tag already exists and nothing was rebuilt** — Push is skipped.
 - **Not logged in** — Push is skipped with a message.
 
 At each Docker Hub step, the script will offer to log you in if you aren't already.
@@ -109,6 +173,8 @@ Note that the size of the ollama install and CUDA support will be > 7GB.  So, it
 ## Sample ./setup run
 
 The following is an example run where the `.env` already has values, dockerhub was already logged-in, and we built a new CUDA 12.4.1 version then pushed it.
+
+This capture predates the Ollama version check; a current run also prints the Phase 4 section shown above between `build successful` and the push prompt.
 
 ```
 $ ./setup
@@ -271,6 +337,90 @@ docker run -d -p 8081:8081 -e OLLAMA_API_KEY=your_api_key -v ollama_docker_volum
 ```
 
 **Note for Windows Users:** On Linux and macOS, the manifests use colons (`:`) in filenames, which are not permitted on Windows filesystems. You may encounter issues mounting the host `~/.ollama` directory on Windows. See [Issue 2032](https://github.com/ollama/ollama/issues/2032) and [Issue 2832 Comment](https://github.com/ollama/ollama/issues/2832#issuecomment-1994889376).
+
+
+
+## Keeping the Image Up to Date
+
+Three separate things can go stale, and they fail independently:
+
+| What | How it goes stale | How it is detected |
+|---|---|---|
+| Your local image | Someone else pushed a newer one under the same tag | Digest comparison against Docker Hub |
+| The Ollama inside the image | Upstream released a new version since the image was built | Version comparison against the latest release |
+| A running container | The image was updated but the container was never recreated | Image ID comparison |
+
+`./check_for_updates` reports all three and offers to fix what it finds:
+
+```
+$ ./check_for_updates
+
+======= check_for_updates: ollama-bearer-auth =======
+
+        image: webstop/ollama-bearer-auth:latest
+
+        local digest:  sha256:c17313ae50015b41e13482d701f2856ba65bc8fd00b1b849fbcbea617ed4a89a
+        hub digest:    sha256:c17313ae50015b41e13482d701f2856ba65bc8fd00b1b849fbcbea617ed4a89a
+        local built:   2025-12-31T23:08:46.000876744-05:00
+        hub updated:   2026-01-01T05:21:56.670677Z
+
+        -> digests match: local image is the published 'webstop/ollama-bearer-auth:latest'
+
+        ollama in image: 0.13.5
+        latest ollama:   0.33.2
+
+WARN    the image is 0.13.5, upstream is 0.33.2
+        -> the image installs ollama at build time, so only a rebuild updates it
+
+        container 'core-cognition-ollama' is running the current local image
+
+        ./setup offers the rebuild, and handles pushing the result.
+
+        Run ./setup now to rebuild with ollama 0.33.2? [y/N]
+```
+
+By default it checks `<IMAGE_OWNER>/<IMAGE_NAME>:<CUDA_VERSION>` from your `.env`. Pass any image reference to check a different one; an untagged reference resolves to `:latest`, the same way Docker resolves it.
+
+```bash
+./check_for_updates webstop/ollama-bearer-auth:latest
+```
+
+Every prompt defaults to no, so pressing return through the whole script only reports.
+
+### Why a registry watcher is not enough
+
+The run above is the common case, and it is worth understanding: **the digests match, yet the deployment is badly out of date.** The container is faithfully running the published `:latest` — that image was simply built back when Ollama was 0.13.5, and nobody has rebuilt it since.
+
+A registry watcher such as Watchtower or diun would report "up to date" here, and be correct. Nothing appears in the registry until *someone rebuilds and pushes*, so a registry-only check stays silent exactly when the Ollama version has drifted furthest. That is why `check_for_updates` compares the Ollama version directly against upstream, rather than watching digests alone.
+
+### Updating a container that consumes this image
+
+A consuming project referencing the image, for example:
+
+```yaml
+services:
+  ollama:
+    image: webstop/ollama-bearer-auth
+```
+
+will **not** pick up a new image on its own. Two things get in the way:
+
+- An untagged reference means `:latest`, a mutable tag that is only resolved at pull time.
+- Docker never re-pulls an image it already has locally. `docker compose up -d`, a container restart, and a host reboot all reuse the local copy.
+
+So a new image reaches a running container only through an explicit pull:
+
+```bash
+docker compose pull ollama && docker compose up -d ollama
+```
+
+`docker compose up -d` alone will not fetch anything. Adding `pull_policy: always` to the service makes `up` check every time. Models are stored in the mounted volume and survive recreation.
+
+`check_for_updates` detects this case directly: it compares the image ID a container was started from against the image ID the tag currently points at, and offers to run the `docker compose ... up -d` command reconstructed from that container's own compose labels. Each container is confirmed separately, since a container using this image often belongs to a different project.
+
+### A note on the tag scheme
+
+Image tags encode only the CUDA version (`webstop/ollama-bearer-auth:12.4.1`), not the Ollama version. An Ollama update therefore republishes a *different image under an unchanged tag*, which is why the push step has to offer an overwrite and why consumers cannot tell from the tag alone whether anything changed. Tagging as `0.33.2-cuda12.4.1` would make updates visible and pinnable; it would also mean consumers must change the tag to update, rather than re-pulling the same one.
 
 
 
