@@ -108,6 +108,20 @@ ensure_env_var OLLAMA_API_KEY --value "sk-ollama-$(openssl rand -hex 16)"
 ensure_env_var EXPOSED_OLLAMA_PORT --prompt "Enter exposed ollama port (default: 8081)" --value 8081
 
 
+# ── ollama version pin ───────────────────────────────────────────────────────
+echo -e "${GREY}        Ollama is installed when the image is built, so its version is"
+echo -e "        fixed at build time. Pin a release (eg: 0.23.2) to rebuild with"
+echo -e "        that exact version - this is how you roll back a regression."
+echo -e "        Enter 'latest' to install the newest release on every rebuild.${RESET}"
+echo
+
+ensure_env_var OLLAMA_VERSION \
+  --prompt "Enter ollama version to install (default: latest)" \
+  --value latest
+
+OLLAMA_PIN="$(pinned_ollama_version)"
+
+
 # ── check local image existence ──────────────────────────────────────────────
 PULLED=false
 REBUILT=false
@@ -165,8 +179,9 @@ else
 
     echo
     assert_cuda_base_image
-    echo "        building image '${FULL_IMAGE}'..."
-    if docker build --no-cache --build-arg CUDA_VERSION="${CUDA_VERSION}" -t "${FULL_IMAGE}" .; then
+    assert_ollama_version "$OLLAMA_PIN"
+    echo "        building image '${FULL_IMAGE}' with ollama ${OLLAMA_PIN:-latest}..."
+    if build_image "$FULL_IMAGE" "$CUDA_VERSION" "$OLLAMA_PIN"; then
       echo "        build successful"
     else
       echo "        build failed"
@@ -177,30 +192,53 @@ fi
 
 echo
 
-# ── report ollama version and offer to update ────────────────────────────────
+# ── report ollama version and offer to rebuild ───────────────────────────────
+# A pin replaces "latest release" as the version the image is compared against,
+# so a pinned rebuild can move ollama backwards as readily as forwards.
 IMAGE_OLLAMA_VERSION="$(image_ollama_version "$FULL_IMAGE")"
-LATEST_OLLAMA_VERSION="$(latest_ollama_version)"
 
 echo "        ollama version in image: ${IMAGE_OLLAMA_VERSION:-unknown}"
-echo "        latest ollama release:   ${LATEST_OLLAMA_VERSION:-unknown  (lookup failed)}"
+if [ -n "$OLLAMA_PIN" ]; then
+  TARGET_OLLAMA_VERSION="$OLLAMA_PIN"
+  echo "        pinned ollama version:   ${OLLAMA_PIN}"
+else
+  TARGET_OLLAMA_VERSION="$(latest_ollama_version)"
+  echo "        latest ollama release:   ${TARGET_OLLAMA_VERSION:-unknown  (lookup failed)}"
+fi
 echo
 
-if [ -z "$IMAGE_OLLAMA_VERSION" ] || [ -z "$LATEST_OLLAMA_VERSION" ]; then
+if [ -z "$IMAGE_OLLAMA_VERSION" ] || [ -z "$TARGET_OLLAMA_VERSION" ]; then
   echo -e "${ORANGE}WARN${RESET}    could not compare ollama versions - update check skipped"
   echo
-elif version_gt "$LATEST_OLLAMA_VERSION" "$IMAGE_OLLAMA_VERSION"; then
-  echo -e "${ORANGE}WARN${RESET}    a newer ollama is available (${IMAGE_OLLAMA_VERSION} -> ${LATEST_OLLAMA_VERSION})"
+elif [ "$IMAGE_OLLAMA_VERSION" = "$TARGET_OLLAMA_VERSION" ]; then
+  if [ -n "$OLLAMA_PIN" ]; then
+    echo -e "${GREEN}NOTE:${RESET}   image matches the pinned ollama ${OLLAMA_PIN}."
+  else
+    echo -e "${GREEN}NOTE:${RESET}   image is already running the latest ollama."
+  fi
   echo
-  echo -e "${GREY}        Updating rebuilds '${FULL_IMAGE}' from scratch, installing"
-  echo -e "        the latest ollama and caddy. Models in ~/.ollama are not affected."
-  echo -e "        Press return to skip.${RESET}"
+elif [ -z "$OLLAMA_PIN" ] && ! version_gt "$TARGET_OLLAMA_VERSION" "$IMAGE_OLLAMA_VERSION"; then
+  # Unpinned, and the image is ahead of the latest release - nothing to offer.
+  echo -e "${GREEN}NOTE:${RESET}   image is already running the latest ollama."
+  echo
+else
+  if [ -n "$OLLAMA_PIN" ]; then
+    echo -e "${ORANGE}WARN${RESET}    image has ollama ${IMAGE_OLLAMA_VERSION}, but ${OLLAMA_PIN} is pinned"
+  else
+    echo -e "${ORANGE}WARN${RESET}    a newer ollama is available (${IMAGE_OLLAMA_VERSION} -> ${TARGET_OLLAMA_VERSION})"
+  fi
+  echo
+  echo -e "${GREY}        Rebuilding '${FULL_IMAGE}' from scratch installs ollama"
+  echo -e "        ${TARGET_OLLAMA_VERSION} and the latest caddy. Models in ~/.ollama are"
+  echo -e "        not affected. Press return to skip.${RESET}"
   echo
 
-  if prompt_yn "Rebuild image with ollama ${LATEST_OLLAMA_VERSION}?"; then
+  if prompt_yn "Rebuild image with ollama ${TARGET_OLLAMA_VERSION}?"; then
     echo
     assert_cuda_base_image
+    assert_ollama_version "$OLLAMA_PIN"
     echo "        rebuilding image '${FULL_IMAGE}'..."
-    if docker build --no-cache --build-arg CUDA_VERSION="${CUDA_VERSION}" -t "${FULL_IMAGE}" .; then
+    if build_image "$FULL_IMAGE" "$CUDA_VERSION" "$OLLAMA_PIN"; then
       echo "        rebuild successful"
       REBUILT=true
       IMAGE_OLLAMA_VERSION="$(image_ollama_version "$FULL_IMAGE")"
@@ -212,9 +250,6 @@ elif version_gt "$LATEST_OLLAMA_VERSION" "$IMAGE_OLLAMA_VERSION"; then
   else
     echo "        update skipped"
   fi
-  echo
-else
-  echo -e "${GREEN}NOTE:${RESET}   image is already running the latest ollama."
   echo
 fi
 

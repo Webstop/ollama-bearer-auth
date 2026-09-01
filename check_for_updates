@@ -149,20 +149,38 @@ fi
 echo
 
 
-# ── 2. ollama in the image vs the latest release ─────────────────────────────
+# ── 2. ollama in the image vs the version it should have ─────────────────────
+# Without a pin that is the latest upstream release; with one it is the pin,
+# so an image built ahead of the pin counts as stale too.
 IMAGE_OLLAMA_VERSION="$(image_ollama_version "$IMAGE_REF")"
-LATEST_OLLAMA_VERSION="$(latest_ollama_version)"
+OLLAMA_PIN="$(pinned_ollama_version)"
 
 echo "        ollama in image: ${IMAGE_OLLAMA_VERSION:-unknown}"
-echo "        latest ollama:   ${LATEST_OLLAMA_VERSION:-unknown  (lookup failed)}"
+if [ -n "$OLLAMA_PIN" ]; then
+  TARGET_OLLAMA_VERSION="$OLLAMA_PIN"
+  echo "        pinned ollama:   ${OLLAMA_PIN}  (OLLAMA_VERSION in .env)"
+else
+  TARGET_OLLAMA_VERSION="$(latest_ollama_version)"
+  echo "        latest ollama:   ${TARGET_OLLAMA_VERSION:-unknown  (lookup failed)}"
+fi
 echo
 
 REBUILD_AVAILABLE=false
 
-if [ -z "$IMAGE_OLLAMA_VERSION" ] || [ -z "$LATEST_OLLAMA_VERSION" ]; then
+if [ -z "$IMAGE_OLLAMA_VERSION" ] || [ -z "$TARGET_OLLAMA_VERSION" ]; then
   echo "        -> could not compare ollama versions"
-elif version_gt "$LATEST_OLLAMA_VERSION" "$IMAGE_OLLAMA_VERSION"; then
-  echo -e "${ORANGE}WARN${RESET}    the image is ${IMAGE_OLLAMA_VERSION}, upstream is ${LATEST_OLLAMA_VERSION}"
+elif [ "$IMAGE_OLLAMA_VERSION" = "$TARGET_OLLAMA_VERSION" ]; then
+  if [ -n "$OLLAMA_PIN" ]; then
+    echo "        -> image matches the pinned ollama ${OLLAMA_PIN}"
+  else
+    echo "        -> image is running the latest ollama"
+  fi
+elif [ -n "$OLLAMA_PIN" ]; then
+  echo -e "${ORANGE}WARN${RESET}    the image is ${IMAGE_OLLAMA_VERSION}, but ${OLLAMA_PIN} is pinned"
+  echo "        -> the image installs ollama at build time, so only a rebuild changes it"
+  REBUILD_AVAILABLE=true
+elif version_gt "$TARGET_OLLAMA_VERSION" "$IMAGE_OLLAMA_VERSION"; then
+  echo -e "${ORANGE}WARN${RESET}    the image is ${IMAGE_OLLAMA_VERSION}, upstream is ${TARGET_OLLAMA_VERSION}"
   echo "        -> the image installs ollama at build time, so only a rebuild updates it"
   REBUILD_AVAILABLE=true
 else
@@ -228,7 +246,7 @@ fi
 if [ "$REBUILD_AVAILABLE" = true ]; then
   echo -e "${GREY}        ./setup offers the rebuild, and handles pushing the result.${RESET}"
   echo
-  if prompt_yn "Run ./setup now to rebuild with ollama ${LATEST_OLLAMA_VERSION}?"; then
+  if prompt_yn "Run ./setup now to rebuild with ollama ${TARGET_OLLAMA_VERSION}?"; then
     echo
     exec "$(dirname "$0")/setup"
   else

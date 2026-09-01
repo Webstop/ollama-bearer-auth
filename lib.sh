@@ -273,3 +273,65 @@ version_gt() {
 }
 
 
+
+# Prints the ollama version pinned in .env, or nothing when the build should
+# track the newest release. An unset value and "latest" both mean "not pinned".
+# Usage: pin="$(pinned_ollama_version)"
+pinned_ollama_version() {
+  local pin
+  pin="$(get_env_var OLLAMA_VERSION)"
+  pin="${pin#v}"
+  [ "$pin" = "latest" ] && pin=""
+  echo "$pin"
+}
+
+
+# Returns 0 if the given ollama release is published, 1 if GitHub reports it is
+# not, and 2 if the check could not be made (offline, rate limited).
+# Usage: ollama_version_exists 0.23.2
+ollama_version_exists() {
+  curl -sf -o /dev/null "https://api.github.com/repos/ollama/ollama/releases/tags/v${1#v}"
+  case $? in
+    0)  return 0 ;;
+    22) return 1 ;;  # HTTP error - no such release
+    *)  return 2 ;;  # could not reach GitHub
+  esac
+}
+
+
+# Aborts before a build when a pinned ollama version does not exist. An empty
+# argument means "not pinned" and is always fine. A check that could not be
+# made is only a warning - the build itself will report the failure.
+# Usage: assert_ollama_version "$OLLAMA_PIN"
+assert_ollama_version() {
+  [ -z "$1" ] && return 0
+  ollama_version_exists "$1"
+  case $? in
+    1)
+      echo -e "${RED}ERROR:${RESET}  ollama ${1} is not a published release"
+      echo
+      echo -e "${GREY}        Set OLLAMA_VERSION in .env to a published version, or to"
+      echo -e "        'latest' to install the newest release - see"
+      echo -e "        https://github.com/ollama/ollama/releases${RESET}"
+      echo
+      exit 1
+      ;;
+    2)
+      echo -e "${ORANGE}WARN${RESET}    could not reach GitHub to verify ollama ${1}"
+      echo "        continuing - the build will fail if that version does not exist"
+      echo
+      ;;
+  esac
+}
+
+
+# Builds the image from the Dockerfile in the current directory, passing the
+# CUDA version and any ollama pin through as build args. An empty pin builds
+# against the latest ollama release.
+# Usage: build_image webstop/ollama-bearer-auth:12.4.1 12.4.1 0.23.2
+build_image() {
+  docker build --no-cache \
+    --build-arg CUDA_VERSION="$2" \
+    --build-arg OLLAMA_VERSION="${3:-latest}" \
+    -t "$1" .
+}

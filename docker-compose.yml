@@ -5,6 +5,9 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        CUDA_VERSION: "${CUDA_VERSION}"
+        OLLAMA_VERSION: "${OLLAMA_VERSION:-latest}"
     image: "${IMAGE_OWNER}/${IMAGE_NAME}:${CUDA_VERSION}"
     runtime: nvidia
     ports:

@@ -12,6 +12,7 @@ Caddy server to securely authenticate and proxy requests to a local Ollama insta
 - **Latest Versions**: Utilizes the latest versions of Ollama and Caddy, ensuring the setup benefits from the most recent updates, security patches, and features. Docker image is configured to pull the latest versions automatically.
 - **GPU Support**: Based on NVIDIA CUDA runtime for Ubuntu 22.04. The `setup` script auto-detects your host CUDA version and resolves the matching container image.
 - **Update Checking**: Both `setup` and `check_for_updates` compare the Ollama version baked into the image against the latest release, and offer to rebuild when it has fallen behind. See [Keeping the Image Up to Date](#keeping-the-image-up-to-date).
+- **Version Pinning**: `OLLAMA_VERSION` pins the Ollama release installed at build time, so a rebuild can roll a regression back to a known-good version. See [Pinning the Ollama version](#pinning-the-ollama-version).
 
 
 
@@ -434,9 +435,42 @@ docker compose pull ollama && docker compose up -d ollama
 
 `check_for_updates` detects this case directly: it compares the image ID a container was started from against the image ID the tag currently points at, and offers to run the `docker compose ... up -d` command reconstructed from that container's own compose labels. Each container is confirmed separately, since a container using this image often belongs to a different project.
 
+### Pinning the Ollama version
+
+Ollama is installed when the image is built, so the *image*, not the container, decides which version runs. `OLLAMA_VERSION` in `.env` controls which release that is:
+
+| Value | Effect |
+|---|---|
+| `latest` (default) | Installs the newest release on every rebuild |
+| `0.23.2` | Installs exactly that release |
+
+`setup` prompts for it and passes it to the build as the `OLLAMA_VERSION` build arg; the Dockerfile hands it to Ollama's `install.sh`, which fetches that specific release. A `v` prefix is accepted, so `v0.23.2` and `0.23.2` behave identically. The version is checked against the GitHub releases API before the build starts, so a typo fails in a second rather than after a full rebuild.
+
+Pinning also changes what "out of date" means. Both scripts normally compare the image against the newest upstream release; with a pin set they compare it against the pin instead, so an image built *ahead* of the pin is reported as stale and offered a rebuild. That is what makes a rollback work:
+
+```
+        ollama in image: 0.33.2
+        pinned ollama:   0.23.2  (OLLAMA_VERSION in .env)
+
+WARN    the image is 0.33.2, but 0.23.2 is pinned
+        -> the image installs ollama at build time, so only a rebuild changes it
+```
+
+To roll a deployment back, on the machine that builds the image:
+
+```bash
+./setup          # answer 0.23.2 at the ollama version prompt
+```
+
+`setup` rebuilds with the pinned release and offers to push the result. Consumers then pull the tag as usual. To resume tracking upstream, set `OLLAMA_VERSION` back to `latest` and rebuild.
+
+One caveat: the pin lives in the `.env` of the checkout you run the scripts from. Run `check_for_updates` from a checkout that has no pin and it compares against upstream latest, so it will report a deliberately rolled-back image as out of date and offer to rebuild it forward again. Keep the pin in the `.env` of every checkout that manages that image.
+
 ### A note on the tag scheme
 
 Image tags encode only the CUDA version (`webstop/ollama-bearer-auth:12.4.1`), not the Ollama version. An Ollama update therefore republishes a *different image under an unchanged tag*, which is why the push step has to offer an overwrite and why consumers cannot tell from the tag alone whether anything changed. Tagging as `0.33.2-cuda12.4.1` would make updates visible and pinnable; it would also mean consumers must change the tag to update, rather than re-pulling the same one.
+
+Pinning sharpens this. A rollback republishes an *older* Ollama under an unchanged tag, so the tag alone cannot tell a consumer whether it just moved forwards or backwards - only the digest changes. That is deliberate: it is what lets a consumer roll back with a plain `docker compose pull`.
 
 
 
@@ -453,6 +487,7 @@ All variables are stored in the `.env` file and configured by the `setup` script
 | Variable | Description | Default |
 |---|---|---|
 | `CUDA_VERSION` | CUDA runtime version used as the image tag | Auto-detected from host |
+| `OLLAMA_VERSION` | Ollama release installed when the image is built, or `latest` | `latest` |
 | `IMAGE_OWNER` | Docker Hub account or organization | Docker Hub username if logged in |
 | `IMAGE_NAME` | Docker image name | `ollama-bearer-auth` |
 | `OLLAMA_API_KEY` | Bearer token for API authentication | Auto-generated `sk-ollama-*` |
