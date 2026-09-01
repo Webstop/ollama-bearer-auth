@@ -2,6 +2,10 @@
 
 source "$(dirname "$0")/lib.sh"
 
+# nvidia-smi is deliberately not required - host_cuda_version() degrades to
+# prompting for the CUDA version when it is missing.
+require_commands curl jq docker openssl
+
 
 echo "=========== setup: ollama-bearer-auth ============"
 echo

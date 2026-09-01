@@ -14,6 +14,8 @@
 
 source "$(dirname "$0")/lib.sh"
 
+require_commands curl jq docker
+
 
 # Prints the digest a local image was pushed to / pulled from, or nothing when
 # the image was built locally and never pushed (RepoDigests is empty then).

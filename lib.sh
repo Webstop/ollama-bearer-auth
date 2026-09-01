@@ -12,6 +12,27 @@ RESET='\033[0m'
 # Must match the FROM line in the Dockerfile.
 CUDA_IMAGE_SUFFIX='-runtime-ubuntu22.04'
 
+# Aborts unless every command named is available on PATH. All missing commands
+# are reported at once rather than one failed run at a time.
+# Usage: require_commands curl jq docker
+require_commands() {
+  local cmd
+  local missing=()
+
+  for cmd in "$@"; do
+    command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
+  done
+
+  [ ${#missing[@]} -eq 0 ] && return 0
+
+  echo -e "${RED}ERROR:${RESET}  missing required command(s): ${missing[*]}" >&2
+  echo >&2
+  echo -e "${GREY}        Install them with your package manager and run this script again -" >&2
+  echo -e "        the package name does not always match the command name.${RESET}" >&2
+  echo >&2
+  exit 1
+}
+
 # Examples:
 #   current_value="$(get_env_var OLLAMA_API_KEY)"
 #   current_value="$(get_env_var DATABASE_URL .env)"

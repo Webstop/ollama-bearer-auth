@@ -21,6 +21,22 @@ Caddy server to securely authenticate and proxy requests to a local Ollama insta
 - Docker Compose
 - NVIDIA GPU with drivers installed (for GPU acceleration)
 
+The `setup` and `check_for_updates` scripts additionally expect these commands
+on your `PATH`:
+
+| Command | Used for | Needed by |
+| --- | --- | --- |
+| `docker` | inspecting, building, pulling and pushing the image | both |
+| `curl` | querying the Docker Hub and GitHub release APIs | both |
+| `jq` | parsing those JSON responses | both |
+| `openssl` | generating the default `OLLAMA_API_KEY` | `setup` |
+
+Both scripts check for these on startup and abort listing everything that is
+missing, so there is no need to verify them by hand first.
+
+`nvidia-smi` is optional. Without it `setup` cannot auto-detect the host CUDA
+version and prompts for it instead.
+
 
 
 ## Acknowledgements
